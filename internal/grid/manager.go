@@ -121,7 +121,7 @@ func NewManager(ctx context.Context, o ManagerOptions) (*Manager, error) {
 		})
 	}
 	if !found {
-		return nil, fmt.Errorf("grid: local host not found")
+		return nil, fmt.Errorf("grid: local host (%s) not found in cluster setup", o.Local)
 	}
 
 	return m, nil
@@ -333,4 +333,14 @@ func (m *Manager) debugMsg(d debugMsg, args ...any) {
 	for _, c := range m.targets {
 		c.debugMsg(d, args...)
 	}
+}
+
+// ConnStats returns the connection statistics for all connections.
+func (m *Manager) ConnStats() madmin.RPCMetrics {
+	var res madmin.RPCMetrics
+	for _, c := range m.targets {
+		t := c.Stats()
+		res.Merge(&t)
+	}
+	return res
 }

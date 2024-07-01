@@ -402,6 +402,29 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
 		ctxt.certsDirSet = true
 	}
 
+	memAvailable := availableMemory()
+	if ctx.IsSet("memlimit") || ctx.GlobalIsSet("memlimit") {
+		memlimit := ctx.String("memlimit")
+		if memlimit == "" {
+			memlimit = ctx.GlobalString("memlimit")
+		}
+		mlimit, err := humanize.ParseBytes(memlimit)
+		if err != nil {
+			return err
+		}
+		if mlimit > memAvailable {
+			logger.Info("WARNING: maximum memory available (%s) smaller than specified --memlimit=%s, ignoring --memlimit value",
+				humanize.IBytes(memAvailable), memlimit)
+		}
+		ctxt.MemLimit = mlimit
+	} else {
+		ctxt.MemLimit = memAvailable
+	}
+
+	if memAvailable < ctxt.MemLimit {
+		ctxt.MemLimit = memAvailable
+	}
+
 	ctxt.FTP = ctx.StringSlice("ftp")
 	ctxt.SFTP = ctx.StringSlice("sftp")
 	ctxt.Interface = ctx.String("interface")
@@ -410,7 +433,6 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
 	ctxt.RecvBufSize = ctx.Int("recv-buf-size")
 	ctxt.IdleTimeout = ctx.Duration("idle-timeout")
 	ctxt.UserTimeout = ctx.Duration("conn-user-timeout")
-	ctxt.ShutdownTimeout = ctx.Duration("shutdown-timeout")
 
 	if conf := ctx.String("config"); len(conf) > 0 {
 		err = mergeServerCtxtFromConfigFile(conf, ctxt)
@@ -812,7 +834,7 @@ func serverHandleEnvVars() {
 		}
 	}
 
-	globalDisableFreezeOnBoot = env.Get("_MINIO_DISABLE_API_FREEZE_ON_BOOT", "") == "true" || serverDebugLog
+	globalEnableSyncBoot = env.Get("MINIO_SYNC_BOOT", config.EnableOff) == config.EnableOn
 }
 
 func loadRootCredentials() {

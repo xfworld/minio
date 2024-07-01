@@ -449,14 +449,18 @@ func (client *storageRESTClient) WriteAll(ctx context.Context, volume string, pa
 }
 
 // CheckParts - stat all file parts.
-func (client *storageRESTClient) CheckParts(ctx context.Context, volume string, path string, fi FileInfo) error {
-	_, err := storageCheckPartsRPC.Call(ctx, client.gridConn, &CheckPartsHandlerParams{
+func (client *storageRESTClient) CheckParts(ctx context.Context, volume string, path string, fi FileInfo) (*CheckPartsResp, error) {
+	var resp *CheckPartsResp
+	resp, err := storageCheckPartsRPC.Call(ctx, client.gridConn, &CheckPartsHandlerParams{
 		DiskID:   *client.diskID.Load(),
 		Volume:   volume,
 		FilePath: path,
 		FI:       fi,
 	})
-	return toStorageErr(err)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // RenameData - rename source path to destination path atomically, metadata and data file.
@@ -516,13 +520,14 @@ func (client *storageRESTClient) ReadVersion(ctx context.Context, origvolume, vo
 	// Use websocket when not reading data.
 	if !opts.ReadData {
 		resp, err := storageReadVersionRPC.Call(ctx, client.gridConn, grid.NewMSSWith(map[string]string{
-			storageRESTDiskID:     *client.diskID.Load(),
-			storageRESTOrigVolume: origvolume,
-			storageRESTVolume:     volume,
-			storageRESTFilePath:   path,
-			storageRESTVersionID:  versionID,
-			storageRESTReadData:   strconv.FormatBool(opts.ReadData),
-			storageRESTHealing:    strconv.FormatBool(opts.Healing),
+			storageRESTDiskID:           *client.diskID.Load(),
+			storageRESTOrigVolume:       origvolume,
+			storageRESTVolume:           volume,
+			storageRESTFilePath:         path,
+			storageRESTVersionID:        versionID,
+			storageRESTInclFreeVersions: strconv.FormatBool(opts.InclFreeVersions),
+			storageRESTReadData:         strconv.FormatBool(opts.ReadData),
+			storageRESTHealing:          strconv.FormatBool(opts.Healing),
 		}))
 		if err != nil {
 			return fi, toStorageErr(err)
@@ -535,6 +540,7 @@ func (client *storageRESTClient) ReadVersion(ctx context.Context, origvolume, vo
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
 	values.Set(storageRESTVersionID, versionID)
+	values.Set(storageRESTInclFreeVersions, strconv.FormatBool(opts.InclFreeVersions))
 	values.Set(storageRESTReadData, strconv.FormatBool(opts.ReadData))
 	values.Set(storageRESTHealing, strconv.FormatBool(opts.Healing))
 
@@ -748,33 +754,33 @@ func (client *storageRESTClient) RenameFile(ctx context.Context, srcVolume, srcP
 	return toStorageErr(err)
 }
 
-func (client *storageRESTClient) VerifyFile(ctx context.Context, volume, path string, fi FileInfo) error {
+func (client *storageRESTClient) VerifyFile(ctx context.Context, volume, path string, fi FileInfo) (*CheckPartsResp, error) {
 	values := make(url.Values)
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
 
 	var reader bytes.Buffer
 	if err := msgp.Encode(&reader, &fi); err != nil {
-		return err
+		return nil, err
 	}
 
 	respBody, err := client.call(ctx, storageRESTMethodVerifyFile, values, &reader, -1)
 	defer xhttp.DrainBody(respBody)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	respReader, err := waitForHTTPResponse(respBody)
 	if err != nil {
-		return toStorageErr(err)
+		return nil, toStorageErr(err)
 	}
 
-	verifyResp := &VerifyFileResp{}
+	verifyResp := &CheckPartsResp{}
 	if err = gob.NewDecoder(respReader).Decode(verifyResp); err != nil {
-		return toStorageErr(err)
+		return nil, toStorageErr(err)
 	}
 
-	return toStorageErr(verifyResp.Err)
+	return verifyResp, nil
 }
 
 func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error) {

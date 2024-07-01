@@ -483,6 +483,11 @@ func (er erasureObjects) newMultipartUpload(ctx context.Context, bucket string, 
 	}
 	fi.DataDir = mustGetUUID()
 
+	if userDefined[ReplicationSsecChecksumHeader] != "" {
+		fi.Checksum, _ = base64.StdEncoding.DecodeString(userDefined[ReplicationSsecChecksumHeader])
+		delete(userDefined, ReplicationSsecChecksumHeader)
+	}
+
 	// Initialize erasure metadata.
 	for index := range partsMetadata {
 		partsMetadata[index] = fi
@@ -1294,9 +1299,18 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		defer lk.Unlock(lkctx)
 	}
 
+	// Accept encrypted checksum from incoming request.
+	if opts.UserDefined[ReplicationSsecChecksumHeader] != "" {
+		if v, err := base64.StdEncoding.DecodeString(opts.UserDefined[ReplicationSsecChecksumHeader]); err == nil {
+			fi.Checksum = v
+		}
+		delete(opts.UserDefined, ReplicationSsecChecksumHeader)
+	}
+
 	if checksumType.IsSet() {
 		checksumType |= hash.ChecksumMultipart | hash.ChecksumIncludesMultipart
-		cs := hash.NewChecksumFromData(checksumType, checksumCombined)
+		var cs *hash.Checksum
+		cs = hash.NewChecksumFromData(checksumType, checksumCombined)
 		fi.Checksum = cs.AppendTo(nil, checksumCombined)
 		if opts.EncryptFn != nil {
 			fi.Checksum = opts.EncryptFn("object-checksum", fi.Checksum)

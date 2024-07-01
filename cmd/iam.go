@@ -52,6 +52,7 @@ import (
 	"github.com/minio/pkg/v3/ldap"
 	"github.com/minio/pkg/v3/policy"
 	etcd "go.etcd.io/etcd/client/v3"
+	"golang.org/x/sync/singleflight"
 )
 
 // UsersSysType - defines the type of users and groups system that is
@@ -76,6 +77,10 @@ const (
 const (
 	embeddedPolicyType  = "embedded-policy"
 	inheritedPolicyType = "inherited-policy"
+)
+
+const (
+	maxSVCSessionPolicySize = 4096
 )
 
 // IAMSys - config system.
@@ -173,9 +178,9 @@ func (sys *IAMSys) initStore(objAPI ObjectLayer, etcdClient *etcd.Client) {
 	}
 
 	if etcdClient == nil {
-		sys.store = &IAMStoreSys{newIAMObjectStore(objAPI, sys.usersSysType)}
+		sys.store = &IAMStoreSys{newIAMObjectStore(objAPI, sys.usersSysType), &singleflight.Group{}}
 	} else {
-		sys.store = &IAMStoreSys{newIAMEtcdStore(etcdClient, sys.usersSysType)}
+		sys.store = &IAMStoreSys{newIAMEtcdStore(etcdClient, sys.usersSysType), &singleflight.Group{}}
 	}
 }
 
@@ -310,6 +315,24 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer, etcdClient *etc
 		break
 	}
 
+	cache := sys.store.lock()
+	setDefaultCannedPolicies(cache.iamPolicyDocsMap)
+	sys.store.unlock()
+
+	// Load RoleARNs
+	sys.rolesMap = make(map[arn.ARN]string)
+
+	// From OpenID
+	if riMap := sys.OpenIDConfig.GetRoleInfo(); riMap != nil {
+		sys.validateAndAddRolePolicyMappings(ctx, riMap)
+	}
+
+	// From AuthN plugin if enabled.
+	if authn := newGlobalAuthNPluginFn(); authn != nil {
+		riMap := authn.GetRoleInfo()
+		sys.validateAndAddRolePolicyMappings(ctx, riMap)
+	}
+
 	// Load IAM data from storage.
 	for {
 		if err := sys.Load(retryCtx, true); err != nil {
@@ -329,24 +352,12 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer, etcdClient *etc
 
 	go sys.periodicRoutines(ctx, refreshInterval)
 
-	// Load RoleARNs
-	sys.rolesMap = make(map[arn.ARN]string)
-
-	// From OpenID
-	if riMap := sys.OpenIDConfig.GetRoleInfo(); riMap != nil {
-		sys.validateAndAddRolePolicyMappings(ctx, riMap)
-	}
-
-	// From AuthN plugin if enabled.
-	if authn := newGlobalAuthNPluginFn(); authn != nil {
-		riMap := authn.GetRoleInfo()
-		sys.validateAndAddRolePolicyMappings(ctx, riMap)
-	}
-
 	sys.printIAMRoles()
 
 	bootstrapTraceMsg("finishing IAM loading")
 }
+
+const maxDurationSecondsForLog = 5
 
 func (sys *IAMSys) periodicRoutines(ctx context.Context, baseInterval time.Duration) {
 	// Watch for IAM config changes for iamStorageWatcher.
@@ -380,7 +391,6 @@ func (sys *IAMSys) periodicRoutines(ctx context.Context, baseInterval time.Durat
 		return baseInterval/2 + randAmt
 	}
 
-	var maxDurationSecondsForLog float64 = 5
 	timer := time.NewTimer(waitInterval())
 	defer timer.Stop()
 
@@ -396,18 +406,6 @@ func (sys *IAMSys) periodicRoutines(ctx context.Context, baseInterval time.Durat
 				if took > maxDurationSecondsForLog {
 					// Log if we took a lot of time to load.
 					logger.Info("IAM refresh took %.2fs", took)
-				}
-			}
-
-			// Purge expired STS credentials.
-			purgeStart := time.Now()
-			if err := sys.store.PurgeExpiredSTS(ctx); err != nil {
-				iamLogIf(ctx, fmt.Errorf("Failure in periodic STS purge for IAM (took %.2fs): %v", time.Since(purgeStart).Seconds(), err))
-			} else {
-				took := time.Since(purgeStart).Seconds()
-				if took > maxDurationSecondsForLog {
-					// Log if we took a lot of time to load.
-					logger.Info("IAM expired STS purge took %.2fs", took)
 				}
 			}
 
@@ -442,7 +440,7 @@ func (sys *IAMSys) validateAndAddRolePolicyMappings(ctx context.Context, m map[a
 	// running server by creating the policies after start up.
 	for arn, rolePolicies := range m {
 		specifiedPoliciesSet := newMappedPolicy(rolePolicies).policySet()
-		validPolicies, _ := sys.store.FilterPolicies(rolePolicies, "")
+		validPolicies, _ := sys.store.MergePolicies(rolePolicies)
 		knownPoliciesSet := newMappedPolicy(validPolicies).policySet()
 		unknownPoliciesSet := specifiedPoliciesSet.Difference(knownPoliciesSet)
 		if len(unknownPoliciesSet) > 0 {
@@ -678,7 +676,7 @@ func (sys *IAMSys) CurrentPolicies(policyName string) string {
 		return ""
 	}
 
-	policies, _ := sys.store.FilterPolicies(policyName, "")
+	policies, _ := sys.store.MergePolicies(policyName)
 	return policies
 }
 
@@ -792,11 +790,15 @@ func (sys *IAMSys) ListLDAPUsers(ctx context.Context) (map[string]madmin.UserInf
 
 	select {
 	case <-sys.configLoaded:
-		ldapUsers := make(map[string]madmin.UserInfo)
-		for user, policy := range sys.store.GetUsersWithMappedPolicies() {
+		stsMap, err := sys.store.GetAllSTSUserMappings(sys.LDAPConfig.IsLDAPUserDN)
+		if err != nil {
+			return nil, err
+		}
+		ldapUsers := make(map[string]madmin.UserInfo, len(stsMap))
+		for user, policy := range stsMap {
 			ldapUsers[user] = madmin.UserInfo{
 				PolicyName: policy,
-				Status:     madmin.AccountEnabled,
+				Status:     statusEnabled,
 			}
 		}
 		return ldapUsers, nil
@@ -977,7 +979,7 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 		if err != nil {
 			return auth.Credentials{}, time.Time{}, err
 		}
-		if len(policyBuf) > 2048 {
+		if len(policyBuf) > maxSVCSessionPolicySize {
 			return auth.Credentials{}, time.Time{}, errSessionPolicyTooLarge
 		}
 	}
@@ -1271,6 +1273,10 @@ func (sys *IAMSys) CreateUser(ctx context.Context, accessKey string, ureq madmin
 
 	if !auth.IsAccessKeyValid(accessKey) {
 		return updatedAt, auth.ErrInvalidAccessKeyLength
+	}
+
+	if auth.ContainsReservedChars(accessKey) {
+		return updatedAt, auth.ErrContainsReservedChars
 	}
 
 	if !auth.IsSecretKeyValid(ureq.SecretKey) {
@@ -1570,31 +1576,16 @@ func (sys *IAMSys) NormalizeLDAPAccessKeypairs(ctx context.Context, accessKeyMap
 
 func (sys *IAMSys) getStoredLDAPPolicyMappingKeys(ctx context.Context, isGroup bool) set.StringSet {
 	entityKeysInStorage := set.NewStringSet()
-	if iamOS, ok := sys.store.IAMStorageAPI.(*IAMObjectStore); ok {
-		// Load existing mapping keys from the cached listing for
-		// `IAMObjectStore`.
-		iamFilesListing := iamOS.cachedIAMListing.Load().(map[string][]string)
-		listKey := policyDBSTSUsersListKey
-		if isGroup {
-			listKey = policyDBGroupsListKey
-		}
-		for _, item := range iamFilesListing[listKey] {
-			stsUserName := strings.TrimSuffix(item, ".json")
-			entityKeysInStorage.Add(stsUserName)
-		}
-	} else {
-		// For non-iam object store, we copy the mapping keys from the cache.
-		cache := sys.store.rlock()
-		defer sys.store.runlock()
-		cachedPolicyMap := cache.iamSTSPolicyMap
-		if isGroup {
-			cachedPolicyMap = cache.iamGroupPolicyMap
-		}
-		cachedPolicyMap.Range(func(k string, v MappedPolicy) bool {
-			entityKeysInStorage.Add(k)
-			return true
-		})
+	cache := sys.store.rlock()
+	defer sys.store.runlock()
+	cachedPolicyMap := cache.iamSTSPolicyMap
+	if isGroup {
+		cachedPolicyMap = cache.iamGroupPolicyMap
 	}
+	cachedPolicyMap.Range(func(k string, v MappedPolicy) bool {
+		entityKeysInStorage.Add(k)
+		return true
+	})
 
 	return entityKeysInStorage
 }
@@ -1720,31 +1711,46 @@ func (sys *IAMSys) NormalizeLDAPMappingImport(ctx context.Context, isGroup bool,
 	return nil
 }
 
-// GetUser - get user credentials
-func (sys *IAMSys) GetUser(ctx context.Context, accessKey string) (u UserIdentity, ok bool) {
+// CheckKey validates the incoming accessKey
+func (sys *IAMSys) CheckKey(ctx context.Context, accessKey string) (u UserIdentity, ok bool, err error) {
 	if !sys.Initialized() {
-		return u, false
+		return u, false, nil
 	}
 
 	if accessKey == globalActiveCred.AccessKey {
-		return newUserIdentity(globalActiveCred), true
+		return newUserIdentity(globalActiveCred), true, nil
 	}
 
 	loadUserCalled := false
 	select {
 	case <-sys.configLoaded:
 	default:
-		sys.store.LoadUser(ctx, accessKey)
+		err = sys.store.LoadUser(ctx, accessKey)
 		loadUserCalled = true
 	}
 
 	u, ok = sys.store.GetUser(accessKey)
 	if !ok && !loadUserCalled {
-		sys.store.LoadUser(ctx, accessKey)
+		err = sys.store.LoadUser(ctx, accessKey)
+		loadUserCalled = true
+
 		u, ok = sys.store.GetUser(accessKey)
 	}
 
-	return u, ok && u.Credentials.IsValid()
+	if !ok && loadUserCalled && err != nil {
+		iamLogOnceIf(ctx, err, accessKey)
+
+		// return 503 to application
+		return u, false, errIAMNotInitialized
+	}
+
+	return u, ok && u.Credentials.IsValid(), nil
+}
+
+// GetUser - get user credentials
+func (sys *IAMSys) GetUser(ctx context.Context, accessKey string) (u UserIdentity, ok bool) {
+	u, ok, _ = sys.CheckKey(ctx, accessKey)
+	return u, ok
 }
 
 // Notify all other MinIO peers to load group.
@@ -1764,6 +1770,10 @@ func (sys *IAMSys) notifyForGroup(ctx context.Context, group string) {
 func (sys *IAMSys) AddUsersToGroup(ctx context.Context, group string, members []string) (updatedAt time.Time, err error) {
 	if !sys.Initialized() {
 		return updatedAt, errServerNotInitialized
+	}
+
+	if auth.ContainsReservedChars(group) {
+		return updatedAt, errGroupNameContainsReservedChars
 	}
 
 	updatedAt, err = sys.store.AddUsersToGroup(ctx, group, members)
@@ -1974,20 +1984,22 @@ func (sys *IAMSys) PolicyDBUpdateLDAP(ctx context.Context, isAttach bool,
 		}
 		isGroup = false
 	} else {
-		if isAttach {
-			var underBaseDN bool
-			if dnResult, underBaseDN, err = sys.LDAPConfig.GetValidatedGroupDN(nil, r.Group); err != nil {
-				iamLogIf(ctx, err)
-				return
-			} else if dnResult == nil || !underBaseDN {
+		var underBaseDN bool
+		if dnResult, underBaseDN, err = sys.LDAPConfig.GetValidatedGroupDN(nil, r.Group); err != nil {
+			iamLogIf(ctx, err)
+			return
+		}
+		if dnResult == nil || !underBaseDN {
+			if !isAttach {
+				dn = r.Group
+			} else {
 				err = errNoSuchGroup
 				return
 			}
+		} else {
 			// We use the group DN returned by the LDAP server (this may not
 			// equal the input group name, but we assume it is canonical).
 			dn = dnResult.NormDN
-		} else {
-			dn = r.Group
 		}
 		isGroup = true
 	}
@@ -2114,7 +2126,7 @@ func (sys *IAMSys) IsAllowedServiceAccount(args policy.Args, parentUser string) 
 	var combinedPolicy policy.Policy
 	// Policies were found, evaluate all of them.
 	if !isOwnerDerived {
-		availablePoliciesStr, c := sys.store.FilterPolicies(strings.Join(svcPolicies, ","), "")
+		availablePoliciesStr, c := sys.store.MergePolicies(strings.Join(svcPolicies, ","))
 		if availablePoliciesStr == "" {
 			return false
 		}
@@ -2206,22 +2218,16 @@ func (sys *IAMSys) IsAllowedSTS(args policy.Args, parentUser string) bool {
 	// 2. Combine the mapped policies into a single combined policy.
 
 	var combinedPolicy policy.Policy
+	// Policies were found, evaluate all of them.
 	if !isOwnerDerived {
-		var err error
-		combinedPolicy, err = sys.store.GetPolicy(strings.Join(policies, ","))
-		if errors.Is(err, errNoSuchPolicy) {
-			for _, pname := range policies {
-				_, err := sys.store.GetPolicy(pname)
-				if errors.Is(err, errNoSuchPolicy) {
-					// all policies presented in the claim should exist
-					iamLogIf(GlobalContext, fmt.Errorf("expected policy (%s) missing from the JWT claim %s, rejecting the request", pname, iamPolicyClaimNameOpenID()))
-					return false
-				}
-			}
-			iamLogIf(GlobalContext, fmt.Errorf("all policies were unexpectedly present!"))
+		availablePoliciesStr, c := sys.store.MergePolicies(strings.Join(policies, ","))
+		if availablePoliciesStr == "" {
+			// all policies presented in the claim should exist
+			iamLogIf(GlobalContext, fmt.Errorf("expected policy (%s) missing from the JWT claim %s, rejecting the request", policies, iamPolicyClaimNameOpenID()))
+
 			return false
 		}
-
+		combinedPolicy = c
 	}
 
 	// 3. If an inline session-policy is present, evaluate it.
@@ -2342,7 +2348,7 @@ func isAllowedBySessionPolicy(args policy.Args) (hasSessionPolicy bool, isAllowe
 
 // GetCombinedPolicy returns a combined policy combining all policies
 func (sys *IAMSys) GetCombinedPolicy(policies ...string) policy.Policy {
-	_, policy := sys.store.FilterPolicies(strings.Join(policies, ","), "")
+	_, policy := sys.store.MergePolicies(strings.Join(policies, ","))
 	return policy
 }
 

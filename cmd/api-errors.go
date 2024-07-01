@@ -287,6 +287,7 @@ const (
 	ErrAdminNoSuchGroup
 	ErrAdminGroupNotEmpty
 	ErrAdminGroupDisabled
+	ErrAdminInvalidGroupName
 	ErrAdminNoSuchJob
 	ErrAdminNoSuchPolicy
 	ErrAdminPolicyChangeAlreadyApplied
@@ -425,6 +426,7 @@ const (
 	ErrAdminProfilerNotEnabled
 	ErrInvalidDecompressedSize
 	ErrAddUserInvalidArgument
+	ErrAddUserValidUTF
 	ErrAdminResourceInvalidArgument
 	ErrAdminAccountNotEligible
 	ErrAccountNotEligible
@@ -442,6 +444,8 @@ const (
 
 	ErrAdminNoAccessKey
 	ErrAdminNoSecretKey
+
+	ErrIAMNotInitialized
 
 	apiErrCodeEnd // This is used only for the testing code
 )
@@ -965,7 +969,7 @@ var errorCodes = errorCodeMap{
 	ErrReplicationRemoteConnectionError: {
 		Code:           "XMinioAdminReplicationRemoteConnectionError",
 		Description:    "Remote service connection error",
-		HTTPStatusCode: http.StatusNotFound,
+		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
 	ErrReplicationBandwidthLimitError: {
 		Code:           "XMinioAdminReplicationBandwidthLimitError",
@@ -1301,6 +1305,11 @@ var errorCodes = errorCodeMap{
 	ErrServerNotInitialized: {
 		Code:           "XMinioServerNotInitialized",
 		Description:    "Server not initialized yet, please try again.",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrIAMNotInitialized: {
+		Code:           "XMinioIAMNotInitialized",
+		Description:    "IAM sub-system not initialized yet, please try again.",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
 	ErrBucketMetadataNotInitialized: {
@@ -2101,6 +2110,16 @@ var errorCodes = errorCodeMap{
 		Description:    "Expected LDAP short username but was given full DN.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrAdminInvalidGroupName: {
+		Code:           "XMinioInvalidGroupName",
+		Description:    "The group name is invalid.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAddUserValidUTF: {
+		Code:           "XMinioInvalidUTF",
+		Description:    "Invalid UTF-8 character detected.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 }
 
 // toAPIErrorCode - Converts embedded errors. Convenience
@@ -2140,6 +2159,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrAdminNoSuchGroup
 	case errGroupNotEmpty:
 		apiErr = ErrAdminGroupNotEmpty
+	case errGroupNameContainsReservedChars:
+		apiErr = ErrAdminInvalidGroupName
 	case errNoSuchJob:
 		apiErr = ErrAdminNoSuchJob
 	case errNoPolicyToAttachOrDetach:
@@ -2154,6 +2175,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrEntityTooSmall
 	case errAuthentication:
 		apiErr = ErrAccessDenied
+	case auth.ErrContainsReservedChars:
+		apiErr = ErrAdminInvalidAccessKey
 	case auth.ErrInvalidAccessKeyLength:
 		apiErr = ErrAdminInvalidAccessKey
 	case auth.ErrInvalidSecretKeyLength:

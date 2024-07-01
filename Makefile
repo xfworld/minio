@@ -47,7 +47,7 @@ lint-fix: getdeps ## runs golangci-lint suite of linters with automatic fixes
 check: test
 test: verifiers build ## builds minio, runs linters, tests
 	@echo "Running unit tests"
-	@MINIO_API_REQUESTS_MAX=10000 CGO_ENABLED=0 go test -v -tags kqueue ./...
+	@MINIO_API_REQUESTS_MAX=10000 CGO_ENABLED=0 go test -v -tags kqueue,dev ./...
 
 test-root-disable: install-race
 	@echo "Running minio root lockdown tests"
@@ -84,13 +84,13 @@ test-race: verifiers build ## builds minio, runs linters, tests (race)
 	@echo "Running unit tests under -race"
 	@(env bash $(PWD)/buildscripts/race.sh)
 
-test-iam: build ## verify IAM (external IDP, etcd backends)
+test-iam: install-race ## verify IAM (external IDP, etcd backends)
 	@echo "Running tests for IAM (external IDP, etcd backends)"
-	@MINIO_API_REQUESTS_MAX=10000 CGO_ENABLED=0 go test -tags kqueue -v -run TestIAM* ./cmd
+	@MINIO_API_REQUESTS_MAX=10000 CGO_ENABLED=0 go test -timeout 15m -tags kqueue,dev -v -run TestIAM* ./cmd
 	@echo "Running tests for IAM (external IDP, etcd backends) with -race"
-	@MINIO_API_REQUESTS_MAX=10000 GORACE=history_size=7 CGO_ENABLED=1 go test -race -tags kqueue -v -run TestIAM* ./cmd
+	@MINIO_API_REQUESTS_MAX=10000 GORACE=history_size=7 CGO_ENABLED=1 go test -timeout 15m -race -tags kqueue,dev -v -run TestIAM* ./cmd
 
-test-iam-ldap-upgrade-import: build ## verify IAM (external LDAP IDP)
+test-iam-ldap-upgrade-import: install-race ## verify IAM (external LDAP IDP)
 	@echo "Running upgrade tests for IAM (LDAP backend)"
 	@env bash $(PWD)/buildscripts/minio-iam-ldap-upgrade-import-test.sh
 
@@ -106,7 +106,10 @@ test-replication-3site:
 test-delete-replication:
 	@(env bash $(PWD)/docs/bucket/replication/delete-replication.sh)
 
-test-replication: install-race test-replication-2site test-replication-3site test-delete-replication test-sio-error ## verify multi site replication
+test-delete-marker-proxying:
+	@(env bash $(PWD)/docs/bucket/replication/test_del_marker_proxying.sh)
+
+test-replication: install-race test-replication-2site test-replication-3site test-delete-replication test-sio-error test-delete-marker-proxying ## verify multi site replication
 	@echo "Running tests for replicating three sites"
 
 test-site-replication-ldap: install-race ## verify automatic site replication
@@ -162,9 +165,9 @@ hotfix-vars:
 	$(eval VERSION := $(shell git describe --tags --abbrev=0).hotfix.$(shell git rev-parse --short HEAD))
 
 hotfix: hotfix-vars clean install ## builds minio binary with hotfix tags
-	@wget -q -c https://github.com/minio/pkger/releases/download/v2.2.9/pkger_2.2.9_linux_amd64.deb
+	@wget -q -c https://github.com/minio/pkger/releases/download/v2.3.1/pkger_2.3.1_linux_amd64.deb
 	@wget -q -c https://raw.githubusercontent.com/minio/minio-service/v1.0.1/linux-systemd/distributed/minio.service
-	@sudo apt install ./pkger_2.2.9_linux_amd64.deb --yes
+	@sudo apt install ./pkger_2.3.1_linux_amd64.deb --yes
 	@mkdir -p minio-release/$(GOOS)-$(GOARCH)/archive
 	@cp -af ./minio minio-release/$(GOOS)-$(GOARCH)/minio
 	@cp -af ./minio minio-release/$(GOOS)-$(GOARCH)/minio.$(VERSION)
@@ -193,7 +196,7 @@ docker: build ## builds minio docker container
 
 install-race: checks build-debugging ## builds minio to $(PWD)
 	@echo "Building minio binary with -race to './minio'"
-	@GORACE=history_size=7 CGO_ENABLED=1 go build -tags kqueue -race -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio 1>/dev/null
+	@GORACE=history_size=7 CGO_ENABLED=1 go build -tags kqueue,dev -race -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio 1>/dev/null
 	@echo "Installing minio binary with -race to '$(GOPATH)/bin/minio'"
 	@mkdir -p $(GOPATH)/bin && cp -af $(PWD)/minio $(GOPATH)/bin/minio
 

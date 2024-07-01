@@ -84,11 +84,12 @@ var ServerFlags = []cli.Flag{
 	},
 	cli.DurationFlag{
 		Name:   "shutdown-timeout",
-		Value:  xhttp.DefaultShutdownTimeout,
-		Usage:  "shutdown timeout to gracefully shutdown server",
+		Value:  time.Second * 30,
+		Usage:  "shutdown timeout to gracefully shutdown server (DEPRECATED)",
 		EnvVar: "MINIO_SHUTDOWN_TIMEOUT",
 		Hidden: true,
 	},
+
 	cli.DurationFlag{
 		Name:   "idle-timeout",
 		Value:  xhttp.DefaultIdleTimeout,
@@ -414,11 +415,12 @@ func serverHandleCmdArgs(ctxt serverCtxt) {
 	setGlobalInternodeInterface(ctxt.Interface)
 
 	globalTCPOptions = xhttp.TCPOptions{
-		UserTimeout:    int(ctxt.UserTimeout.Milliseconds()),
-		DriveOPTimeout: globalDriveConfig.GetOPTimeout,
-		Interface:      ctxt.Interface,
-		SendBufSize:    ctxt.SendBufSize,
-		RecvBufSize:    ctxt.RecvBufSize,
+		UserTimeout: int(ctxt.UserTimeout.Milliseconds()),
+		// FIXME: Bring this back when we have valid way to handle deadlines
+		//		DriveOPTimeout: globalDriveConfig.GetOPTimeout,
+		Interface:   ctxt.Interface,
+		SendBufSize: ctxt.SendBufSize,
+		RecvBufSize: ctxt.RecvBufSize,
 	}
 
 	// allow transport to be HTTP/1.1 for proxying.
@@ -430,7 +432,7 @@ func serverHandleCmdArgs(ctxt serverCtxt) {
 		RoundTripper: globalRemoteTargetTransport,
 		Logger: func(err error) {
 			if err != nil && !errors.Is(err, context.Canceled) {
-				replLogIf(GlobalContext, err)
+				proxyLogIf(GlobalContext, err)
 			}
 		},
 	})
@@ -679,10 +681,8 @@ func getServerListenAddrs() []string {
 	// Use a string set to avoid duplication
 	addrs := set.NewStringSet()
 	// Listen on local interface to receive requests from Console
-	for _, ip := range mustGetLocalIPs() {
-		if ip != nil && ip.IsLoopback() {
-			addrs.Add(net.JoinHostPort(ip.String(), globalMinioPort))
-		}
+	for _, ip := range localLoopbacks.ToSlice() {
+		addrs.Add(net.JoinHostPort(ip, globalMinioPort))
 	}
 	host, _ := mustSplitHostPort(globalMinioAddr)
 	if host != "" {
@@ -739,6 +739,8 @@ func initializeLogRotate(ctx *cli.Context) (io.WriteCloser, error) {
 
 // serverMain handler called for 'minio server' command.
 func serverMain(ctx *cli.Context) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	var warnings []string
 
 	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
@@ -834,7 +836,7 @@ func serverMain(ctx *cli.Context) {
 
 	// Set system resources to maximum.
 	bootstrapTrace("setMaxResources", func() {
-		_ = setMaxResources(ctx)
+		_ = setMaxResources(globalServerCtxt)
 	})
 
 	// Verify kernel release and version.
@@ -865,7 +867,6 @@ func serverMain(ctx *cli.Context) {
 		httpServer := xhttp.NewServer(getServerListenAddrs()).
 			UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 			UseTLSConfig(newTLSConfig(getCert)).
-			UseShutdownTimeout(globalServerCtxt.ShutdownTimeout).
 			UseIdleTimeout(globalServerCtxt.IdleTimeout).
 			UseReadHeaderTimeout(globalServerCtxt.ReadHeaderTimeout).
 			UseBaseContext(GlobalContext).
@@ -896,7 +897,7 @@ func serverMain(ctx *cli.Context) {
 		})
 	}
 
-	if !globalDisableFreezeOnBoot {
+	if globalEnableSyncBoot {
 		// Freeze the services until the bucket notification subsystem gets initialized.
 		bootstrapTrace("freezeServices", freezeServices)
 	}
@@ -918,6 +919,20 @@ func serverMain(ctx *cli.Context) {
 		nodeNameSum := sha256.Sum256([]byte(nodeName + globalDeploymentID()))
 		globalNodeNamesHex[hex.EncodeToString(nodeNameSum[:])] = struct{}{}
 	}
+
+	bootstrapTrace("waitForQuorum", func() {
+		result := newObject.Health(context.Background(), HealthOptions{})
+		for !result.HealthyRead {
+			if debugNoExit {
+				logger.Info("Not waiting for quorum since we are debugging.. possible cause unhealthy sets (%s)", result)
+				break
+			}
+			d := time.Duration(r.Float64() * float64(time.Second))
+			logger.Info("Waiting for quorum READ healthcheck to succeed.. possible cause unhealthy sets (%s), retrying in %s", result, d)
+			time.Sleep(d)
+			result = newObject.Health(context.Background(), HealthOptions{})
+		}
+	})
 
 	var err error
 	bootstrapTrace("initServerConfig", func() {
@@ -985,12 +1000,11 @@ func serverMain(ctx *cli.Context) {
 	}()
 
 	go func() {
-		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-		if !globalDisableFreezeOnBoot {
+		if globalEnableSyncBoot {
 			defer bootstrapTrace("unfreezeServices", unfreezeServices)
 			t := time.AfterFunc(5*time.Minute, func() {
-				warnings = append(warnings, color.YellowBold("- Initializing the config subsystem is taking longer than 5 minutes. Please set '_MINIO_DISABLE_API_FREEZE_ON_BOOT=true' to not freeze the APIs"))
+				warnings = append(warnings,
+					color.YellowBold("- Initializing the config subsystem is taking longer than 5 minutes. Please remove 'MINIO_SYNC_BOOT=on' to not freeze the APIs"))
 			})
 			defer t.Stop()
 		}
@@ -1040,11 +1054,11 @@ func serverMain(ctx *cli.Context) {
 			bootLogIf(GlobalContext, globalEventNotifier.InitBucketTargets(GlobalContext, newObject))
 		})
 
-		var buckets []BucketInfo
+		var buckets []string
 		// List buckets to initialize bucket metadata sub-sys.
 		bootstrapTrace("listBuckets", func() {
 			for {
-				buckets, err = newObject.ListBuckets(GlobalContext, BucketOptions{})
+				bucketsList, err := newObject.ListBuckets(GlobalContext, BucketOptions{NoMetadata: true})
 				if err != nil {
 					if configRetriableErrors(err) {
 						logger.Info("Waiting for list buckets to succeed to initialize buckets.. possible cause (%v)", err)
@@ -1054,6 +1068,10 @@ func serverMain(ctx *cli.Context) {
 					bootLogIf(GlobalContext, fmt.Errorf("Unable to list buckets to initialize bucket metadata sub-system: %w", err))
 				}
 
+				buckets = make([]string, len(bucketsList))
+				for i := range bucketsList {
+					buckets[i] = bucketsList[i].Name
+				}
 				break
 			}
 		})
